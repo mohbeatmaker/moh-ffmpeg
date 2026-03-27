@@ -5,11 +5,13 @@ const fs           = require('fs');
 const path         = require('path');
 const os           = require('os');
 const https        = require('https');
+const http         = require('http');
+const { URL }      = require('url');
 
 ffmpeg.setFfmpegPath(ffmpegStatic);
 
 const app = express();
-app.use(express.json({ limit: '1mb' })); // plus de base64 — juste des IDs
+app.use(express.json({ limit: '1mb' }));
 
 app.get('/', (req, res) => res.send('MOH FFmpeg Service — OK'));
 
@@ -23,11 +25,16 @@ app.post('/encode', async (req, res) => {
   const assPath    = path.join(tmpDir, 'subtitles.ass');
 
   try {
-    // Télécharger MP3 et vidéo artiste depuis les URLs Drive
     await downloadFile(mp3_url,   mp3Path);
     await downloadFile(video_url, videoPath);
 
-    // Fichier ASS pour les overlays texte
+    // Vérifier que les fichiers téléchargés ne sont pas des pages HTML
+    const videoHead = fs.readFileSync(videoPath, { encoding: null }).slice(0, 20);
+    const videoHeadStr = videoHead.toString('utf8');
+    if (videoHeadStr.startsWith('<!') || videoHeadStr.startsWith('<h') || videoHeadStr.startsWith('<?')) {
+      throw new Error('artist.mp4 téléchargé est une page HTML — problème de partage Drive ou de redirect');
+    }
+
     fs.writeFileSync(assPath, buildAssFile(slides, width, height));
 
     await new Promise((resolve, reject) => {
@@ -68,14 +75,42 @@ app.post('/encode', async (req, res) => {
   }
 });
 
-function downloadFile(url, destPath) {
+// ─── DOWNLOAD avec suivi multi-redirects + cookie ─────────────
+function downloadFile(url, destPath, maxRedirects = 10, cookies = '') {
   return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(destPath);
-    https.get(url, resp => {
-      if (resp.statusCode === 302 || resp.statusCode === 301) {
-        https.get(resp.headers.location, r => r.pipe(file).on('finish', resolve).on('error', reject));
+    const parsedUrl = new URL(url);
+    const lib       = parsedUrl.protocol === 'https:' ? https : http;
+
+    const options = {
+      hostname: parsedUrl.hostname,
+      path:     parsedUrl.pathname + parsedUrl.search,
+      headers:  {
+        'User-Agent': 'Mozilla/5.0',
+        ...(cookies ? { 'Cookie': cookies } : {}),
+      },
+    };
+
+    lib.get(options, resp => {
+      // Collecter les cookies de la réponse (important pour Drive antivirus warning)
+      const setCookie = resp.headers['set-cookie'];
+      const newCookies = setCookie
+        ? setCookie.map(c => c.split(';')[0]).join('; ')
+        : cookies;
+
+      if (resp.statusCode === 301 || resp.statusCode === 302 || resp.statusCode === 303 || resp.statusCode === 307) {
+        if (maxRedirects <= 0) { reject(new Error('Trop de redirections : ' + url)); return; }
+        const location = resp.headers.location;
+        const nextUrl  = location.startsWith('http') ? location : parsedUrl.origin + location;
+        // Vider la réponse courante avant de suivre la redirect
+        resp.resume();
+        downloadFile(nextUrl, destPath, maxRedirects - 1, newCookies).then(resolve).catch(reject);
+      } else if (resp.statusCode === 200) {
+        const file = fs.createWriteStream(destPath);
+        resp.pipe(file);
+        file.on('finish', () => file.close(resolve));
+        file.on('error', reject);
       } else {
-        resp.pipe(file).on('finish', resolve).on('error', reject);
+        reject(new Error('HTTP ' + resp.statusCode + ' pour ' + url));
       }
     }).on('error', reject);
   });
