@@ -28,14 +28,13 @@ app.post('/encode', async (req, res) => {
     await downloadFile(mp3_url,   mp3Path);
     await downloadFile(video_url, videoPath);
 
-    // Vérifier que les fichiers téléchargés ne sont pas des pages HTML
-    const videoHead = fs.readFileSync(videoPath, { encoding: null }).slice(0, 20);
-    const videoHeadStr = videoHead.toString('utf8');
-    if (videoHeadStr.startsWith('<!') || videoHeadStr.startsWith('<h') || videoHeadStr.startsWith('<?')) {
-      throw new Error('artist.mp4 téléchargé est une page HTML — problème de partage Drive ou de redirect');
+    // Vérifier que le fichier vidéo n'est pas une page HTML
+    const head = fs.readFileSync(videoPath, { encoding: null }).slice(0, 20).toString('utf8');
+    if (head.startsWith('<!') || head.startsWith('<h') || head.startsWith('<?')) {
+      throw new Error('artist.mp4 est une page HTML — vérifier le partage Drive');
     }
 
-    fs.writeFileSync(assPath, buildAssFile(slides, width, height));
+    fs.writeFileSync(assPath, buildAssFile(slides || [], width, height));
 
     await new Promise((resolve, reject) => {
       let cmd = ffmpeg()
@@ -44,7 +43,15 @@ app.post('/encode', async (req, res) => {
         .input(mp3Path)
         .audioCodec('aac')
         .videoCodec('libx264')
-        .outputOptions(['-map 0:v:0', '-map 1:a:0', '-crf 23', '-preset fast', '-movflags +faststart', '-pix_fmt yuv420p']);
+        .outputOptions([
+          '-map 0:v:0',
+          '-map 1:a:0',
+          '-crf 28',           // compression plus agressive = fichier + petit
+          '-preset ultrafast', // encode plus vite = moins de RAM
+          '-movflags +faststart',
+          '-pix_fmt yuv420p',
+          '-threads 1',        // limite l'usage mémoire multi-thread
+        ]);
 
       if (duration && duration > 0) cmd = cmd.duration(duration);
       else cmd = cmd.outputOptions(['-shortest']);
@@ -63,19 +70,31 @@ app.post('/encode', async (req, res) => {
         .run();
     });
 
-    const outputBuffer = fs.readFileSync(outputPath);
-    res.set('Content-Type', 'video/mp4');
-    res.send(outputBuffer);
+    // ✅ STREAM depuis le disque — ne charge pas le fichier en RAM
+    const stat = fs.statSync(outputPath);
+    res.set({
+      'Content-Type':   'video/mp4',
+      'Content-Length': stat.size,
+    });
+
+    const readStream = fs.createReadStream(outputPath);
+    readStream.pipe(res);
+    readStream.on('end', () => {
+      try { fs.rmSync(tmpDir, { recursive: true }); } catch(_) {}
+    });
+    readStream.on('error', (e) => {
+      console.error('Stream error:', e.message);
+      try { fs.rmSync(tmpDir, { recursive: true }); } catch(_) {}
+    });
 
   } catch(e) {
-    console.error('Erreur FFmpeg :', e.message);
-    res.status(500).json({ error: e.message });
-  } finally {
+    console.error('Erreur:', e.message);
     try { fs.rmSync(tmpDir, { recursive: true }); } catch(_) {}
+    if (!res.headersSent) res.status(500).json({ error: e.message });
   }
 });
 
-// ─── DOWNLOAD avec suivi multi-redirects + cookie ─────────────
+// ─── DOWNLOAD multi-redirects + cookies ───────────────────────
 function downloadFile(url, destPath, maxRedirects = 10, cookies = '') {
   return new Promise((resolve, reject) => {
     const parsedUrl = new URL(url);
@@ -84,24 +103,22 @@ function downloadFile(url, destPath, maxRedirects = 10, cookies = '') {
     const options = {
       hostname: parsedUrl.hostname,
       path:     parsedUrl.pathname + parsedUrl.search,
-      headers:  {
+      headers: {
         'User-Agent': 'Mozilla/5.0',
         ...(cookies ? { 'Cookie': cookies } : {}),
       },
     };
 
     lib.get(options, resp => {
-      // Collecter les cookies de la réponse (important pour Drive antivirus warning)
-      const setCookie = resp.headers['set-cookie'];
+      const setCookie  = resp.headers['set-cookie'];
       const newCookies = setCookie
         ? setCookie.map(c => c.split(';')[0]).join('; ')
         : cookies;
 
-      if (resp.statusCode === 301 || resp.statusCode === 302 || resp.statusCode === 303 || resp.statusCode === 307) {
-        if (maxRedirects <= 0) { reject(new Error('Trop de redirections : ' + url)); return; }
+      if ([301, 302, 303, 307].includes(resp.statusCode)) {
+        if (maxRedirects <= 0) { reject(new Error('Trop de redirections')); return; }
         const location = resp.headers.location;
         const nextUrl  = location.startsWith('http') ? location : parsedUrl.origin + location;
-        // Vider la réponse courante avant de suivre la redirect
         resp.resume();
         downloadFile(nextUrl, destPath, maxRedirects - 1, newCookies).then(resolve).catch(reject);
       } else if (resp.statusCode === 200) {
